@@ -14,7 +14,7 @@ from datetime import datetime
 from fake_useragent import UserAgent
 
 # Brand ID to scrape
-brand_id = 115
+brand_id = 31  # Isabel Marant
 
 # Vinted taxonomy data embedded directly in the script
 VINTED_TAXONOMY_DATA = [
