@@ -8,6 +8,40 @@ import ssl
 import urllib.request
 from fake_useragent import UserAgent
 import cloudscraper
+from pathlib import Path
+import os
+import glob
+import uuid
+import re
+import argparse
+
+# Optional curl-cffi HTTP/2 + TLS mimic
+try:
+    from curl_cffi import requests as curl_requests
+    _CURL_AVAILABLE = True
+except Exception:
+    _CURL_AVAILABLE = False
+
+# Optional Playwright client import
+try:
+    from scrapers.vinted_scraper_playwright import PlaywrightVintedClient
+except Exception:
+    try:
+        from vinted_scraper_playwright import PlaywrightVintedClient
+    except Exception:
+        PlaywrightVintedClient = None
+
+# Resolve paths relative to repo root
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RAW_DATA_DIR = (REPO_ROOT / 'data' / 'vinted_tests' / 'raw_data')
+RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR = (REPO_ROOT / 'data' / 'logs' / 'vinted')
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+RAW_JSON_DIR = (REPO_ROOT / 'data' / 'vinted_tests' / 'raw_json')
+RAW_JSON_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR = (REPO_ROOT / 'data' / 'vinted_tests' / 'state')
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+VINTED_TAXONOMY_PATH = (REPO_ROOT / 'data' / 'vinted_taxonomy.csv')
 
 # Initialize fake user agent
 try:
@@ -31,15 +65,137 @@ def get_random_user_agent():
         ]
         return random.choice(user_agents)
 
+def _infer_platform_from_ua(user_agent: str):
+    ua = user_agent.lower()
+    if 'windows nt' in ua:
+        return 'Windows', False
+    if 'android' in ua:
+        return 'Android', True
+    if 'iphone' in ua or 'ipad' in ua or 'ios' in ua:
+        return 'iOS', True
+    if 'macintosh' in ua or 'mac os x' in ua:
+        return 'macOS', False
+    if 'linux' in ua:
+        return 'Linux', False
+    return 'Windows', False
+
+def build_client_hints_headers(user_agent: str) -> dict:
+    platform, is_mobile = _infer_platform_from_ua(user_agent)
+    # Keep Chromium-like ch-ua; versions are not strictly validated server-side
+    sec_ch_ua = '"Not)A;Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+    return {
+        "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua-mobile": "?1" if is_mobile else "?0",
+        "sec-ch-ua-platform": f'"{platform}"'
+    }
+
+def ensure_anon_id(session: requests.Session) -> bool:
+    """Set x-anon-id header only if cookie anon_id exists; otherwise remove it.
+    Returns True if header set, False otherwise."""
+    try:
+        cookie_anon = session.cookies.get("anon_id")
+    except Exception:
+        cookie_anon = None
+    if cookie_anon:
+        session.headers.update({"x-anon-id": cookie_anon})
+        return True
+    # Remove any stale header
+    if 'x-anon-id' in session.headers:
+        session.headers.pop('x-anon-id', None)
+    return False
+
+def log_response(prefix: str, response: requests.Response, note: str = "") -> None:
+    try:
+        ts = int(time.time())
+        fname = LOGS_DIR / f"{prefix}_{response.status_code}_{ts}.log"
+        body = ""
+        try:
+            body = response.text
+        except Exception:
+            body = "<no-text>"
+        body = body[:4000]
+        with open(fname, 'w', encoding='utf-8') as f:
+            f.write(f"{note}\n")
+            f.write(f"URL: {getattr(response.request, 'url', '')}\n")
+            f.write(f"METHOD: {getattr(response.request, 'method', '')}\n")
+            f.write(f"REQ_HEADERS: {getattr(response.request, 'headers', {})}\n")
+            f.write(f"RESP_HEADERS: {dict(response.headers)}\n")
+            f.write(f"STATUS: {response.status_code}\n\n")
+            f.write(body)
+    except Exception:
+        pass
+
+def save_raw_json(payload: dict, brand_id: int, cat_id: int, page_nb: int) -> None:
+    try:
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        target_dir = RAW_JSON_DIR / str(brand_id) / str(cat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        out = target_dir / f"{ts}_p{page_nb}.json"
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _state_path(brand_id: int, cat_id: int) -> Path:
+    return STATE_DIR / f"{brand_id}_{cat_id}.json"
+
+def read_last_seen(brand_id: int, cat_id: int):
+    try:
+        p = _state_path(brand_id, cat_id)
+        if not p.exists():
+            return None
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get('last_seen_item_id')
+    except Exception:
+        return None
+
+def write_last_seen(brand_id: int, cat_id: int, last_seen_id) -> None:
+    try:
+        p = _state_path(brand_id, cat_id)
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({
+                'last_seen_item_id': last_seen_id,
+                'updated_at': datetime.utcnow().isoformat()
+            }, f)
+    except Exception:
+        pass
+
+_pw_client_singleton = None
+
+def get_playwright_client(proxy: str | None):
+    global _pw_client_singleton
+    if PlaywrightVintedClient is None:
+        return None
+    if _pw_client_singleton is None:
+        try:
+            _pw_client_singleton = PlaywrightVintedClient(proxy=proxy, headless=True)
+        except Exception:
+            _pw_client_singleton = None
+    return _pw_client_singleton
+
+def reset_playwright_client(proxy: str | None):
+    global _pw_client_singleton
+    try:
+        if _pw_client_singleton is not None:
+            _pw_client_singleton.close()
+    except Exception:
+        pass
+    _pw_client_singleton = None
+    return get_playwright_client(proxy)
+
 '''
-ssl._create_default_https_context = ssl._create_unverified_context
-opener = urllib.request.build_opener(
-    urllib.request.ProxyHandler(
-        {'http': 'http://brd-customer-hl_44a8fa04-zone-unblocker:5aef1i6b54iw@brd.superproxy.io:22225',
-        'https': 'http://brd-customer-hl_44a8fa04-zone-unblocker:5aef1i6b54iw@brd.superproxy.io:22225'}))
+# Legacy paid proxy example removed
+# ssl._create_default_https_context = ssl._create_unverified_context
+# opener = urllib.request.build_opener(
+#     urllib.request.ProxyHandler({
+#         'http': 'http://USER:PASS@HOST:PORT',
+#         'https': 'http://USER:PASS@HOST:PORT'
+#     })
+# )
 '''
 
-vinted_taxonomy = pd.read_csv('../data/vinted_taxonomy.csv')  
+vinted_taxonomy = pd.read_csv(VINTED_TAXONOMY_PATH)
 
 def cat_name_finder(cat_id):
     return vinted_taxonomy[vinted_taxonomy['category_id']==cat_id]['category_name'].to_list()[0]
@@ -152,9 +308,7 @@ def create_new_session():
     session.headers.update({
         "accept": "application/json, text/plain, */*",
         "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
-        "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        **build_client_hints_headers(user_agent),
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
@@ -173,7 +327,7 @@ def create_new_session():
         
     return session
 
-def handle_rate_limiting(session, retry_count=0, max_retries=3):
+def handle_rate_limiting(session, retry_count=0, max_retries=3, response=None):
     """
     Handle rate limiting by implementing exponential backoff
     """
@@ -181,7 +335,21 @@ def handle_rate_limiting(session, retry_count=0, max_retries=3):
         print("Max retries reached for rate limiting")
         return False
     
-    wait_time = 60 * (2 ** retry_count)  # Exponential backoff: 60s, 120s, 240s
+    wait_time = 60 * (2 ** retry_count)  # Exponential backoff default
+    # Use Retry-After header if present
+    try:
+        if response is not None:
+            ra = response.headers.get('Retry-After')
+            if ra:
+                if re.fullmatch(r"\d+", ra):
+                    wait_time = max(wait_time, int(ra))
+                else:
+                    # HTTP-date format
+                    from email.utils import parsedate_to_datetime
+                    ra_dt = parsedate_to_datetime(ra)
+                    wait_time = max(wait_time, int((ra_dt - datetime.utcnow()).total_seconds()))
+    except Exception:
+        pass
     print(f"Rate limited. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}...")
     time.sleep(wait_time)
     
@@ -195,53 +363,30 @@ def test_vinted_connection():
     """
     Test the connection to Vinted to ensure we can access the site
     """
-    # Try direct connection first (local IP)
-    print("Testing direct connection (local IP)...")
-    if test_direct_connection():
-        print("✅ Successfully connected to Vinted directly")
-        return True
-    
-    # If direct connection fails, try with proxy
-    print("Direct connection failed, trying proxy...")
+    # Proxy-only checks
     proxy = get_working_proxy()
-    if proxy:
-        print(f"Testing connection with proxy: {proxy}")
-        session = requests.Session()
-        session.proxies.update({'http': proxy, 'https': proxy})
-        
-        # Disable SSL verification for proxy connections (only for regular sessions)
-        session.verify = False
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        session.headers.update({
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-        })
-        
-        try:
-            response = session.get("https://www.vinted.fr/", timeout=30)
-            if response.status_code == 200:
-                print("✅ Successfully connected to Vinted with proxy")
+    if not proxy:
+        print("❌ No working proxy available (free proxy pool empty).")
+        return False
+
+    # Final fallback: try Playwright session (browser-context)
+    try:
+        pw = get_playwright_client(get_working_proxy())
+        if pw is not None:
+            # Use cookie-seeded requests session to test API endpoint
+            sess = pw.get_cookies_and_ua_session()
+            r = sess.get("https://www.vinted.fr/api/v2/catalog/items?page=1&per_page=1", timeout=30)
+            if r.status_code == 200:
+                print("✅ Playwright context can access Vinted")
                 return True
             else:
-                print(f"❌ Failed to connect to Vinted with proxy: HTTP {response.status_code}")
-        except Exception as e:
-            print(f"❌ Error connecting to Vinted with proxy: {e}")
-    
-    print("❌ Failed to connect to Vinted with any method")
+                print(f"❌ Playwright context failed: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"❌ Playwright fallback error: {e}")
+    print("❌ Failed to connect to Vinted via proxy methods")
     return False
 
-def simulate_browser_session(session):
+def simulate_browser_session(session, cat_id: int | None = None, brand_id: int | None = None):
     """
     Simulate a real browser session by visiting pages in the correct order
     """
@@ -262,9 +407,13 @@ def simulate_browser_session(session):
             print(f"Failed to access search page: {search_response.status_code}")
             return False
             
-        # Step 3: Visit a specific category page to get category-specific tokens
+        # Step 3: Visit a specific category/brand page to get category-specific tokens
         time.sleep(random.uniform(1, 3))
-        category_response = session.get("https://www.vinted.fr/catalog?catalog[]=221", timeout=30)
+        target_cat = 221 if cat_id is None else cat_id
+        url = f"https://www.vinted.fr/catalog?catalog[]={target_cat}"
+        if brand_id is not None:
+            url += f"&brand_ids[]={brand_id}"
+        category_response = session.get(url, timeout=30)
         if category_response.status_code != 200:
             print(f"Failed to access category page: {category_response.status_code}")
             return False
@@ -331,7 +480,34 @@ def refresh_session_cookies(session):
         print(f"Error refreshing cookies: {e}")
         return False
 
-def cat_api_caller(page_nb, cat_id, brand_id, session=None):    
+def _requests_like_get(session, url, params=None, timeout=30):
+    if _CURL_AVAILABLE:
+        try:
+            # Use Chromium JA3/tls fingerprint; http2=True defaults to h2
+            with curl_requests.Session(impersonate="chrome", http2=True) as s:
+                s.headers.update(session.headers)
+                if getattr(session, 'proxies', None):
+                    s.proxies.update(session.proxies)
+                resp = s.get(url, params=params, timeout=timeout)
+                class _R:
+                    pass
+                r = _R()
+                r.status_code = resp.status_code
+                r.headers = resp.headers
+                r.text = resp.text
+                def _json():
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {}
+                r.json = _json
+                r.request = type('rq', (), { 'url': resp.url, 'method': 'GET', 'headers': s.headers })
+                return r
+        except Exception:
+            pass
+    return session.get(url, params=params, timeout=timeout)
+
+def cat_api_caller(page_nb, cat_id, brand_id, session=None, use_playwright=True, proxy=None, order: str | None = None, save_raw: bool = True):    
     # Create a session if not provided
     if session is None:
         # Try to use cloudscraper first, fallback to regular session
@@ -353,9 +529,7 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
         session.headers.update({
             "accept": "application/json, text/plain, */*",
             "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            **build_client_hints_headers(user_agent),
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -371,7 +545,7 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
         time.sleep(random.uniform(1, 3))
         
         # Simulate a real browser session
-        if not simulate_browser_session(session):
+        if not simulate_browser_session(session, cat_id=cat_id, brand_id=brand_id):
             return pd.DataFrame(), False
 
     # Configure proxy if needed
@@ -403,7 +577,7 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
         "time": str(current_timestamp),
         "search_text": "",
         "catalog_ids": str(cat_id),
-        "order": "relevance",
+        "order": (order or "relevance"),
         "catalog_from": "0",
         "size_ids": "",
         "brand_ids": str(brand_id),
@@ -412,24 +586,19 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
         "material_ids": ""
     }
     
-    # Set referer based on page number
-    if page_nb == 1:
-        referer = 'https://www.vinted.fr/'
-    else:
-        referer = f'https://www.vinted.fr/catalog?time={current_timestamp}&catalog[]={cat_id}&catalog_from=0&page={page_nb-1}&brand_ids[]={brand_id}'
+    # Set referer based on page number (use specific catalog/brand page even for first page)
+    base_ref = f'https://www.vinted.fr/catalog?time={current_timestamp}&catalog[]={cat_id}&catalog_from=0&brand_ids[]={brand_id}'
+    referer = base_ref if page_nb == 1 else f'{base_ref}&page={page_nb-1}'
     
     # Update session headers for this request
+    # Update session headers for this request and add Origin
     session.headers.update({
-        "referer": referer
+        "referer": referer,
+        "origin": "https://www.vinted.fr"
     })
     
     # Handle anon_id cookie carefully to avoid conflicts
-    try:
-        anon_id = session.cookies.get("anon_id", "04dfd096-880e-4a73-8905-ef7bc54d8272")
-        session.headers.update({"x-anon-id": anon_id})
-    except Exception:
-        # If there are cookie conflicts, use default anon_id
-        session.headers.update({"x-anon-id": "04dfd096-880e-4a73-8905-ef7bc54d8272"})
+    ensure_anon_id(session)
     
     # Make the API request with retry logic
     max_retries = 3
@@ -437,7 +606,30 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
     
     for retry in range(max_retries):
         try:
-            response = session.get(url, params=querystring, timeout=30)
+            if use_playwright and PlaywrightVintedClient is not None:
+                for attempt_pw in range(2):
+                    try:
+                        pw = get_playwright_client(proxy)
+                        if pw is None:
+                            break
+                        data = pw.fetch_catalog_items(page_nb, cat_id, brand_id, per_page=96)
+                        if isinstance(data, dict) and data.get('items') is not None:
+                            df = vinted_api_to_df(data)
+                            df['category_id'] = cat_id
+                            df['category_name'] = cat_name_finder(cat_id)
+                            return df, True
+                        else:
+                            print(f"Playwright fetch failed or blocked (attempt {attempt_pw+1}): {str(data)[:200]}")
+                    except Exception as e:
+                        print(f"Playwright error (attempt {attempt_pw+1}): {e}")
+                    # Reset playwright and retry once on error/empty
+                    if attempt_pw == 0:
+                        reset_playwright_client(proxy)
+                        time.sleep(random.uniform(1, 2))
+                        continue
+                    break
+                # fall through to requests mode
+            response = _requests_like_get(session, url, params=querystring, timeout=30)
             break  # Success, exit retry loop
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if retry < max_retries - 1:
@@ -451,6 +643,7 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
     # Check for different response codes
     if response.status_code == 403:
         print(f"403 Forbidden - Access denied. Response: {response.text[:200]}")
+        log_response("403", response, note="Blocked at catalog endpoint")
         
         # Invalidate proxy cache since we got blocked
         invalidate_proxy_cache()
@@ -488,7 +681,8 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
                 return pd.DataFrame(), False
     elif response.status_code == 429:
         print(f"429 Too Many Requests - Rate limited.")
-        if handle_rate_limiting(session):
+        log_response("429", response, note="Rate limited at catalog endpoint")
+        if handle_rate_limiting(session, response=response):
             return pd.DataFrame(), True  # Try again
         else:
             return pd.DataFrame(), False
@@ -510,6 +704,11 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
         
     # Parse JSON response
     data = response.json()
+    if save_raw:
+        try:
+            save_raw_json(data, brand_id, cat_id, page_nb)
+        except Exception:
+            pass
     
     if not data.get('items') or len(data['items']) == 0:
         print('No more items')
@@ -522,6 +721,72 @@ def cat_api_caller(page_nb, cat_id, brand_id, session=None):
     
     return df, True
 
+def run_brand_category_collection(brand_id: int, category_ids: list[int], pages: int = 10, mode: str = 'delta', use_playwright: bool = True, order: str | None = None):
+    session = create_robust_session()
+    if session is None:
+        print("Failed to create a working session. Exiting.")
+        return pd.DataFrame()
+    full_df = pd.DataFrame()
+    for cat_id in category_ids:
+        print(f"Collecting brand {brand_id}, category {cat_id} in {mode} mode")
+        last_seen = read_last_seen(brand_id, cat_id) if mode == 'delta' else None
+        new_top_id = None
+        stop = False
+        for page in range(1, pages + 1):
+            df, cont = cat_api_caller(page, cat_id, brand_id, session=session, use_playwright=use_playwright, order=order)
+            if df is None or len(df) == 0:
+                print("No data, stopping")
+                break
+            if page == 1:
+                try:
+                    new_top_id = int(df['id'].iloc[0])
+                except Exception:
+                    new_top_id = None
+            if last_seen is not None:
+                try:
+                    if int(last_seen) in set(df['id'].astype(int).tolist()):
+                        print("Reached last-seen item, stopping delta crawl for this category")
+                        stop = True
+                except Exception:
+                    pass
+            full_df = pd.concat([full_df, df])
+            if stop or not cont:
+                break
+            time.sleep(random.uniform(0.4, 1.2))
+        if mode == 'delta' and new_top_id is not None:
+            write_last_seen(brand_id, cat_id, new_top_id)
+    return full_df
+
+def parse_category_list_arg(cats_arg: str) -> list[int]:
+    """Parse comma-separated category IDs or the keyword 'all'.
+    Accepts float-like tokens (e.g., '221.0')."""
+    if not cats_arg:
+        return []
+    if cats_arg.strip().lower() == 'all':
+        try:
+            return sorted(list(pd.Series(vinted_taxonomy['category_id']).dropna().astype(int).unique()))
+        except Exception:
+            # Fallback: try coercing via float then int
+            vals = []
+            for x in pd.Series(vinted_taxonomy['category_id']).dropna().tolist():
+                try:
+                    vals.append(int(float(x)))
+                except Exception:
+                    continue
+            return sorted(list(set(vals)))
+    result: list[int] = []
+    for tok in cats_arg.split(','):
+        t = tok.strip()
+        if not t:
+            continue
+        try:
+            val = int(t) if '.' not in t else int(float(t))
+            result.append(val)
+        except Exception:
+            print(f"Skipping invalid category token: {t}")
+            continue
+    return result
+
 def full_vinted_cat_api_caller(brand_id, start_id=None, total_page_nb=None, auto_resume=True):
     """
     Main function to collect Vinted data with automatic resumption
@@ -532,7 +797,22 @@ def full_vinted_cat_api_caller(brand_id, start_id=None, total_page_nb=None, auto
         if detected_cat_id is not None:
             print(f"Auto-resuming from category {detected_cat_id} ({detected_cat_name})")
             start_id = detected_cat_id
-            total_page_nb = detected_pages
+            
+            # Get the total page number from the latest file
+            import glob
+            import os
+            pattern = f"../data/vinted_tests/raw_data/{brand_id}_*.csv"
+            files = glob.glob(pattern)
+            if files:
+                latest_file = max(files, key=os.path.getctime)
+                filename = os.path.basename(latest_file)
+                try:
+                    total_page_nb = int(filename.split('_')[1].split('.')[0])
+                    print(f"Resuming from total page {total_page_nb}")
+                except:
+                    total_page_nb = detected_pages
+            else:
+                total_page_nb = detected_pages
     
     # Create robust session
     session = create_robust_session()
@@ -559,6 +839,10 @@ def full_vinted_cat_api_caller(brand_id, start_id=None, total_page_nb=None, auto
     session_failures = 0
     max_session_failures = 5
     
+    # Track categories for better logging
+    total_categories = len(vinted_taxonomy)
+    processed_categories = 0
+    
     for i, row in vinted_taxonomy.iterrows():
         # Skip to start_id if specified
         if start_id != None:
@@ -569,7 +853,8 @@ def full_vinted_cat_api_caller(brand_id, start_id=None, total_page_nb=None, auto
                 print(f"Found start_id {start_id}, beginning collection")
                 start_id = None  # Reset so we process all subsequent categories
         
-        print(f'Started {row["category_name"]}')
+        processed_categories += 1
+        print(f'Started {row["category_name"]} ({processed_categories}/{total_categories})')
         category_success = False
         category_pages = 0
         
@@ -619,9 +904,17 @@ def full_vinted_cat_api_caller(brand_id, start_id=None, total_page_nb=None, auto
                 break
         
         if category_success:
-            print(f"Completed {row['category_name']} ({category_pages} pages)\n")
+            print(f"✅ Completed {row['category_name']} ({category_pages} pages)\n")
         else:
-            print(f"Failed to collect data for {row['category_name']}\n")
+            print(f"❌ Failed to collect data for {row['category_name']} (no items found)\n")
+            
+        # Add delay between categories to avoid rate limiting
+        time.sleep(random.uniform(2, 5))
+    
+    print(f"\n🎯 Collection Summary:")
+    print(f"Total categories processed: {processed_categories}/{total_categories}")
+    print(f"Total items collected: {len(full_df)}")
+    print(f"Total pages collected: {pages_collected}")
             
     return full_df
 
@@ -781,9 +1074,7 @@ def create_robust_session(max_attempts=5):
             session.headers.update({
                 "accept": "application/json, text/plain, */*",
                 "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
-                "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                **build_client_hints_headers(user_agent),
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
@@ -793,6 +1084,12 @@ def create_robust_session(max_attempts=5):
                 "upgrade-insecure-requests": "1",
                 "cache-control": "no-cache",
                 "pragma": "no-cache"
+            })
+            # Align optional params seen in real calls
+            session.params = session.params or {}
+            session.params.update({
+                "currency": "EUR",
+                "disable_search_saving": "false"
             })
             
             # Add proxy if available
@@ -835,33 +1132,75 @@ def test_session(session):
 
 def test_proxy_connection(proxy):
     """
-    Test if the proxy connection is working
+    Test if the proxy connection is working using neutral endpoints.
     """
     try:
         proxies = {'http': proxy, 'https': proxy}
         session = requests.Session()
         session.proxies.update(proxies)
-        
-        # Disable SSL verification for proxy testing
         session.verify = False
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        response = session.get("https://www.vinted.fr/", timeout=30)
-        if response.status_code == 200:
-            print(f"✅ Proxy test successful: {proxy}")
-            return True
-        else:
-            print(f"❌ Proxy test failed: HTTP {response.status_code}")
+
+        # Fast no-content test
+        r1 = session.get("https://www.google.com/generate_204", timeout=10)
+        if r1.status_code not in (204, 200):
             return False
-    except Exception as e:
-        print(f"❌ Proxy test error: {e}")
+        # Check a JSON echo endpoint
+        r2 = session.get("https://httpbin.org/ip", timeout=10)
+        if r2.status_code != 200:
+            return False
+        return True
+    except Exception:
         return False
 
 # Global cache for working proxy
 _working_proxy_cache = None
 _proxy_cache_time = 0
 PROXY_CACHE_DURATION = 300  # 5 minutes
+
+def _fetch_free_proxies() -> list[str]:
+    """
+    Fetch a list of fresh free HTTP proxies from public sources.
+    Returns a list like ["host:port", ...].
+    """
+    sources = [
+        # Plain host:port per line
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    ]
+    results: list[str] = []
+    for url in sources:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200 and resp.text:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '://' in line:
+                        # Normalize http://host:port → host:port
+                        try:
+                            line = line.split('://', 1)[1]
+                        except Exception:
+                            continue
+                    # Filter out auth-bearing proxies (paid)
+                    if '@' in line:
+                        continue
+                    # Basic format host:port
+                    if ':' in line and line.count(':') == 1:
+                        results.append(line)
+        except Exception:
+            continue
+    # Deduplicate while preserving order
+    seen = set()
+    uniq: list[str] = []
+    for p in results:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq[:500]
 
 def invalidate_proxy_cache():
     """
@@ -873,107 +1212,71 @@ def invalidate_proxy_cache():
     print("Proxy cache invalidated")
 
 def test_direct_connection():
-    """
-    Test if direct connection (local IP) works
-    """
-    try:
-        session = requests.Session()
-        session.headers.update({
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "accept-language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-        })
-        
-        response = session.get("https://www.vinted.fr/", timeout=30)
-        if response.status_code == 200:
-            print("✅ Direct connection (local IP) works")
-            return True
-        else:
-            print(f"❌ Direct connection failed: HTTP {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"❌ Direct connection error: {e}")
-        return False
+    # Disabled: proxy-only mode
+    return False
 
 def get_working_proxy(force_test=False):
     """
-    Get a working proxy from available options with caching
+    Get a working free proxy with caching. Paid proxies and auth-based endpoints are ignored.
     """
     global _working_proxy_cache, _proxy_cache_time
-    
     current_time = time.time()
-    
+
     # Return cached proxy if it's still valid
     if not force_test and _working_proxy_cache and (current_time - _proxy_cache_time) < PROXY_CACHE_DURATION:
         print(f"Using cached working proxy: {_working_proxy_cache}")
         return _working_proxy_cache
-    
-    # First try direct connection (local IP)
-    print("Testing direct connection (local IP)...")
-    if test_direct_connection():
-        print("Using direct connection (no proxy needed)")
-        _working_proxy_cache = None  # No proxy needed
-        _proxy_cache_time = current_time
-        return None  # Return None to indicate no proxy needed
-    
-    # If direct connection fails, try proxies
-    print("Direct connection failed, trying proxies...")
-    proxy_options = [
-        # Your existing Bright Data proxies
-        'http://brd-customer-hl_44a8fa04-zone-data_center:8ht957dpf6o0@brd.superproxy.io:33335',
-        'http://brd-customer-hl_44a8fa04-zone-unblocker:5aef1i6b54iw@brd.superproxy.io:22225',
-        
-        # Free proxy options (less reliable but worth trying)
-        'http://185.199.229.156:7492',
-        'http://185.199.228.220:7492',
-        'http://185.199.231.45:7492',
-        'http://185.199.230.102:7492',
-        
-        # Add more proxy options here
-    ]
-    
-    for proxy in proxy_options:
-        print(f"Testing proxy: {proxy}")
+
+    candidates = _fetch_free_proxies()
+    if not candidates:
+        print("❌ Could not fetch free proxies.")
+        return None
+
+    # Try a handful quickly
+    max_to_try = 20
+    for raw in candidates[:max_to_try]:
+        proxy = raw if raw.startswith('http') else f"http://{raw}"
+        print(f"Testing free proxy: {proxy}")
         if test_proxy_connection(proxy):
             _working_proxy_cache = proxy
             _proxy_cache_time = current_time
             print(f"Cached working proxy: {proxy}")
             return proxy
-    
-    print("❌ No working proxies found")
+
+    print("❌ No working free proxies found right now")
     _working_proxy_cache = None
     return None
 
     
     
 if __name__ == '__main__':
-    # Test connection first
+    parser = argparse.ArgumentParser(description='Vinted brand/category collector')
+    parser.add_argument('--brand', type=int, help='Brand ID (required for targeted run)')
+    parser.add_argument('--cats', type=str, help='Comma-separated category IDs or "all"')
+    parser.add_argument('--pages', type=int, default=10, help='Max pages per category')
+    parser.add_argument('--mode', type=str, default='delta', choices=['delta', 'full'], help='Collection mode')
+    parser.add_argument('--use-playwright', action='store_true', help='Use Playwright fetch path')
+    parser.add_argument('--order', type=str, default=None, help='Order param (e.g., newest_first)')
+    parser.add_argument('--auto', action='store_true', help='Run legacy auto-resume over full taxonomy')
+    args = parser.parse_args()
+
     if not test_vinted_connection():
-        print("Cannot connect to Vinted. Please check your internet connection or try again later.")
-        exit(1)
-    
-    brand_id = 130332 ## Balzac
-    brand_id = 115 ##Sandro
-    #brand_id = 121 ## Isabel Marant
-    
-    # Use auto-resume feature
-    print("Starting Vinted scraper with auto-resume feature...")
-    df = full_vinted_cat_api_caller(brand_id, auto_resume=True)
-    
-    print(f"Collection completed. Total items collected: {len(df)}")
-    #print(df)
-    #df, cot =cat_api_caller(1, 221, 130332)
-    #print(df)
-    #for i,row in vinted_taxonomy.iterrows():
-    #    print(cat_name_finder(row['category_id']))
+        print("Cannot connect directly via basic checks; proceeding with Playwright if available...")
+        # We do not exit here because Playwright fallback may still work
+
+    if args.auto:
+        # Legacy full taxonomy run
+        brand_id = args.brand if args.brand else 765
+        print("Starting Vinted scraper with auto-resume feature...")
+        df = full_vinted_cat_api_caller(brand_id, auto_resume=True)
+        print(f"Collection completed. Total items collected: {len(df)}")
+    else:
+        if not args.brand or not args.cats:
+            print('Please provide --brand and --cats (comma-separated) or use --auto')
+            exit(1)
+        cats = parse_category_list_arg(args.cats)
+        df = run_brand_category_collection(args.brand, cats, pages=args.pages, mode=args.mode, use_playwright=args.use_playwright or True, order=args.order)
+        print(f"Completed targeted run. Total items collected: {len(df)}")
 
 
 

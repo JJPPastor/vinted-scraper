@@ -11,6 +11,8 @@ import numpy as np
 import uuid
 import random
 import string
+import os
+import glob
 
 vc_taxo = pd.read_csv('../data/vestiaire_taxonomy.csv')
 macro_vc_taxo = pd.read_csv('../data/macro_vestiaire_taxonomy.csv')
@@ -244,9 +246,13 @@ def vestiaire_scraper(brand_id, catalogLinksWithoutLanguage):
     total_pages, full_df = vc_api_call(brand_id, catalogLinksWithoutLanguage, 0)
     print(total_pages)
     
+    # Apply hard limit of 19 pages per category
+    max_pages = min(total_pages, 19)
+    
     if total_pages < 16:
         ### Iterates over number of pages 
-        for i in range(1, total_pages):
+        print(f"Total pages available: {total_pages}, limiting to: {max_pages}")
+        for i in range(1, max_pages):
             temp_df = vc_api_call(brand_id, catalogLinksWithoutLanguage, i)
             full_df = pd.concat([full_df, temp_df])
             full_df.to_csv(f"../data/vc_tests/{catalogLinksWithoutLanguage.replace('/','')}_{i}.csv")
@@ -351,26 +357,180 @@ def cat_api_caller(page_nb, brand_id, catalogLinksWithoutLanguage, universe_id, 
         return temp_df
     
 
+def find_last_collected_category(catalogLinksWithoutLanguage, continuous=False):
+    """
+    Find the last collected category by checking existing CSV files
+    Prioritizes vc_tests data files
+    Returns the index of the last collected category, or 0 if no files found
+    """
+    brand_name = catalogLinksWithoutLanguage.replace('/','')
+    
+    # First, check for vc_tests files (priority)
+    vc_tests_pattern = f"../data/vc_tests/{brand_name}.csv"
+    if os.path.exists(vc_tests_pattern):
+        print(f"Found vc_tests file: {vc_tests_pattern}")
+        try:
+            df = pd.read_csv(vc_tests_pattern)
+            print(f"vc_tests file columns: {list(df.columns)}")
+            
+            # Check if the required columns exist
+            required_columns = ['universe', 'parent_cat', 'category', 'sub_category']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                print(f"Missing required columns in vc_tests file: {missing_columns}")
+                return 0
+            
+            # Get the last unique combination of categories
+            last_categories = df[required_columns].drop_duplicates().tail(1)
+            if not last_categories.empty:
+                last_row = last_categories.iloc[0]
+                print(f"Last collected category from vc_tests: {last_row['universe']}, {last_row['parent_cat']}, {last_row['category']}, {last_row['sub_category']}")
+                return last_row
+            else:
+                print("No categories found in vc_tests file")
+                return 0
+                
+        except Exception as e:
+            print(f"Error reading vc_tests file: {e}")
+            return 0
+    
+    # If no vc_tests file, check other locations
+    possible_files = []
+    
+    # Check for continuous data files
+    if continuous:
+        pattern = f"../data/vc_continuous/{brand_name}/*.csv"
+        files = glob.glob(pattern)
+        possible_files.extend(files)
+    
+    # Check for regular data files
+    pattern = f"../data/{brand_name}_full_vc.csv"
+    if os.path.exists(pattern):
+        possible_files.append(pattern)
+    
+    # Check for legacy full files
+    pattern = f"../data/{brand_name}_full.csv"
+    if os.path.exists(pattern):
+        possible_files.append(pattern)
+    
+    print(f"Found {len(possible_files)} other possible data files for {brand_name}")
+    
+    if not possible_files:
+        print("No existing files found, starting from beginning")
+        return 0
+    
+    # Get the most recent file
+    latest_file = max(possible_files, key=os.path.getctime)
+    print(f"Using most recent file: {latest_file}")
+    
+    # Read the file to find the last category
+    try:
+        df = pd.read_csv(latest_file)
+        print(f"File columns: {list(df.columns)}")
+        
+        # Check if the required columns exist
+        required_columns = ['universe', 'parent_cat', 'category', 'sub_category']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            print(f"Missing required columns: {missing_columns}")
+            return 0
+        
+        # Get the last unique combination of categories
+        last_categories = df[required_columns].drop_duplicates().tail(1)
+        if not last_categories.empty:
+            last_row = last_categories.iloc[0]
+            print(f"Last collected category: {last_row['universe']}, {last_row['parent_cat']}, {last_row['category']}, {last_row['sub_category']}")
+            return last_row
+        else:
+            print("No categories found in the file")
+            return 0
+            
+    except Exception as e:
+        print(f"Error reading existing file: {e}")
+        return 0
+    
+    return 0
+
 def full_cat_vc_api_call(brand_id, catalogLinksWithoutLanguage, continuous=False, macro_taxo=False):
+    # Check for existing data and find last collected category
+    last_collected = find_last_collected_category(catalogLinksWithoutLanguage, continuous)
+    
     full_df = pd.DataFrame()
     if macro_taxo:
         taxo = macro_vc_taxo
     else:
         taxo = vc_taxo
-    for i, row in taxo.iterrows(): 
+    
+    # If we found existing data, load it
+    if last_collected != 0:
+        brand_name = catalogLinksWithoutLanguage.replace('/','')
+        
+        # First, check for vc_tests files (priority)
+        vc_tests_pattern = f"../data/vc_tests/{brand_name}.csv"
+        if os.path.exists(vc_tests_pattern):
+            print(f"Loading existing data from vc_tests: {vc_tests_pattern}")
+            full_df = pd.read_csv(vc_tests_pattern)
+        else:
+            # If no vc_tests file, check other locations
+            possible_files = []
+            
+            if continuous:
+                pattern = f"../data/vc_continuous/{brand_name}/*.csv"
+                files = glob.glob(pattern)
+                possible_files.extend(files)
+            
+            # Check for regular data files
+            pattern = f"../data/{brand_name}_full_vc.csv"
+            if os.path.exists(pattern):
+                possible_files.append(pattern)
+            
+            # Check for legacy full files
+            pattern = f"../data/{brand_name}_full.csv"
+            if os.path.exists(pattern):
+                possible_files.append(pattern)
+            
+            if possible_files:
+                latest_file = max(possible_files, key=os.path.getctime)
+                print(f"Loading existing data from: {latest_file}")
+                full_df = pd.read_csv(latest_file)
+            else:
+                print("No existing files found to load")
+    
+    # Find the starting index based on last collected category
+    start_index = 0
+    if last_collected != 0:
+        # Find the index of the last collected category in the taxonomy
+        for i, row in taxo.iterrows():
+            if (row['universe'] == last_collected['universe'] and 
+                row['parent_cat'] == last_collected['parent_cat'] and 
+                row['category'] == last_collected['category'] and 
+                row['sub_category'] == last_collected['sub_category']):
+                start_index = i + 1  # Start from the next category
+                print(f"Resuming from category index {start_index}")
+                break
+    
+    # Process categories starting from the determined index
+    for i, row in taxo.iloc[start_index:].iterrows(): 
         print(f"Started Collecting: {row['universe']}, {row['parent_cat']}, {row['category']}, {row['sub_category']}.")
         total_pages, temp_df = cat_api_caller(0, brand_id, catalogLinksWithoutLanguage, row['universe_id'], row['parent_cat_id'], row['category_id'], row['sub_category_id'])
         full_df = pd.concat([full_df, temp_df])
+        # Apply hard limit of 19 pages per category
+        max_pages = min(total_pages, 19)
+        
         if total_pages == 1: 
             print(f"Finished Collecting: {row['universe']}, {row['parent_cat']}, {row['category']}, {row['sub_category']}.\n")
             continue
         else: 
-            for i in range(1,total_pages):
+            print(f"Total pages available: {total_pages}, limiting to: {max_pages}")
+            for i in range(1, max_pages):
                 temp_df = cat_api_caller(i, brand_id, catalogLinksWithoutLanguage, row['universe_id'], row['parent_cat_id'], row['category_id'], row['sub_category_id'])
                 full_df = pd.concat([full_df, temp_df])
                 full_df.to_csv(f"../data/vc_tests/{catalogLinksWithoutLanguage.replace('/','')}.csv")
                 print(f"Collecting page {i+1}: {row['universe']}, {row['parent_cat']}, {row['category']}, {row['sub_category']}.")
         print(f"Finished Collecting: {row['universe']}, {row['parent_cat']}, {row['category']}, {row['sub_category']}.\n")
+    
     if continuous == True:
         full_df.to_csv(f"../data/vc_continuous/{catalogLinksWithoutLanguage.replace('/','')}/{datetime.today().date()}.csv")
     else: 
@@ -393,6 +553,8 @@ if __name__ == '__main__':
     catalogLinksWithoutLanguage = '/canada-goose/' 
     brand_id = 28
     catalogLinksWithoutLanguage = '/zadig-voltaire/'
+    '''brand_id = 23
+    catalogLinksWithoutLanguage = '/sandro/' '''
     full_cat_vc_api_call(brand_id, catalogLinksWithoutLanguage, True, False)
     
     '''We're gonna do a manual split

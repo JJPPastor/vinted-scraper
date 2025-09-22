@@ -189,11 +189,11 @@ async def macro_cond_collector(path):
         conditions.pop()
     df['condition'] = conditions
     print(df)
-    df.to_csv('../data/vc_tests/cond_test.csv')
+    df.to_csv('../data/vc_tests/cond_test_isabel-marant.csv')
     
     
 if __name__ == '__main__': 
-    asyncio.run(macro_cond_collector('../data/balzac-paris_full_vc.csv'))
+    asyncio.run(macro_cond_collector('../data/vc_tests/isabel-marant.csv'))
     #driver = driver_setup()
     #html = asyncio.run(get_page(driver, 'https://www.vestiairecollective.com/women-clothing/coats/other-stories/black-wool-other-stories-coat-57334896.shtml'))
     #print(html)
